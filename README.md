@@ -1,0 +1,2 @@
+# tool_codex_thread_handoff
+Codexのスレッドを、別のAIエージェント等に引き継ぐための、要約やCodexスレッド情報などのハンドオフセットを作るツール
