@@ -643,7 +643,7 @@ internal static class PromptBuilder
         builder.AppendLine("Write every JSON string in the dominant language of the user messages.");
         builder.AppendLine("purpose is the current goal.");
         builder.AppendLine("decisions are important decisions that are already made.");
-        builder.AppendLine("currentState describes completed work and the actual state. When the transcript says work is implemented but git status shows uncommitted changes or no such change, say that in currentState.");
+        builder.AppendLine("currentState describes completed work and the actual state. When git status shows uncommitted changes for work the transcript calls finished, say that those changes are still uncommitted. A clean status, or a path missing from status, is not evidence that the work is absent; it may already be committed. Do not claim the implementation is missing only because the working tree does not list it.");
         builder.AppendLine("remainingWork is work that is still open.");
         builder.AppendLine("rejectedApproaches are failed or rejected approaches that should not be retried. Use an empty array when none are important.");
         builder.AppendLine("openQuestions are important uncertainties and risks. Use an empty array when none are important.");
@@ -845,11 +845,11 @@ internal static class ArtifactBuilder
     {
         if (string.IsNullOrWhiteSpace(toolEntryFile))
         {
-            return $"Entry file was not recorded. Clone {RepositoryUrl} and run codex-thread-handoff.cs from that checkout. 入口ファイルの絶対パスは記録されていません。{RepositoryUrl} を取得し、その中の codex-thread-handoff.cs を実行してください。";
+            return $"Entry file was not recorded. Clone {RepositoryUrl} and run codex-thread-handoff.cs from that checkout. Dump commands are PowerShell; paste them into pwsh. Single quotes keep each argument literal. 入口ファイルの絶対パスは記録されていません。{RepositoryUrl} を取得し、その中の codex-thread-handoff.cs を実行してください。dump コマンドは PowerShell です。pwsh に貼って実行します。単一引用符の中は引数そのものです。";
         }
 
         var fullPath = Path.GetFullPath(toolEntryFile);
-        return $"Entry file: {fullPath}. Source repository: {RepositoryUrl}. Run dump with --file set to this entry file; the working directory can be another repository. 入口ファイルは {fullPath} です。作業ディレクトリが別リポジトリでも、--file にこの絶対パスを指定して dump を実行します。取得元は {RepositoryUrl} の codex-thread-handoff.cs です。";
+        return $"Entry file: {fullPath}. Source repository: {RepositoryUrl}. Run dump with --file set to this entry file; the working directory can be another repository. Dump commands are PowerShell; paste them into pwsh. Single quotes keep each argument literal. 入口ファイルは {fullPath} です。作業ディレクトリが別リポジトリでも、--file にこの絶対パスを指定して dump を実行します。取得元は {RepositoryUrl} の codex-thread-handoff.cs です。dump コマンドは PowerShell です。pwsh に貼って実行します。単一引用符の中は引数そのものです。";
     }
 
     public static HandoffArtifact Build(
@@ -864,8 +864,9 @@ internal static class ArtifactBuilder
         var entryArgument = string.IsNullOrWhiteSpace(toolEntryFile)
             ? "codex-thread-handoff.cs"
             : Path.GetFullPath(toolEntryFile);
-        var quotedEntry = QuoteCommandArgument(entryArgument);
-        var quotedOutput = QuoteCommandArgument(Path.GetFullPath(outputPath));
+        var quotedEntry = QuotePowerShellLiteral(entryArgument);
+        var quotedDeeplink = QuotePowerShellLiteral(deeplink);
+        var quotedOutput = QuotePowerShellLiteral(Path.GetFullPath(outputPath));
         return new HandoffArtifact(
             "1",
             new SourceInfo(
@@ -876,7 +877,7 @@ internal static class ArtifactBuilder
                     HumanReread,
                     CodexEnvironment,
                     DescribeToolLocation(toolEntryFile),
-                    $"dotnet run --file {quotedEntry} -- dump {deeplink}",
+                    $"dotnet run --file {quotedEntry} -- dump {quotedDeeplink}",
                     $"dotnet run --file {quotedEntry} -- dump {quotedOutput}")),
             repository.Snapshot,
             body,
@@ -884,15 +885,9 @@ internal static class ArtifactBuilder
             repository.Warnings);
     }
 
-    private static string QuoteCommandArgument(string value)
-    {
-        if (value.IndexOfAny([' ', '\t', '"']) < 0)
-        {
-            return value;
-        }
-
-        return "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
-    }
+    // dump コマンドは PowerShell に貼る。単一引用符は $ や部分式を展開しない。
+    internal static string QuotePowerShellLiteral(string value) =>
+        "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
 }
 
 internal sealed record DumpMessage(
@@ -1650,7 +1645,20 @@ internal static class CodexLaunchResolver
 
         if (!OperatingSystem.IsWindows())
         {
-            return extension.Length == 0;
+            // 実行ビットの無いファイルを選ぶと、後ろの実行ファイルや codex.js へ進めない。
+            if (extension.Length != 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                return HasAnyExecuteBit(File.GetUnixFileMode(path));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
         }
 
         if (extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
@@ -1665,6 +1673,12 @@ internal static class CodexLaunchResolver
         }
 
         return HasPeHeader(path);
+    }
+
+    internal static bool HasAnyExecuteBit(UnixFileMode mode)
+    {
+        const UnixFileMode execute = UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+        return (mode & execute) != 0;
     }
 
     private static bool HasPeHeader(string path)

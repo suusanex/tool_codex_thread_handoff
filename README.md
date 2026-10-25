@@ -40,7 +40,7 @@ dotnet run --file codex-thread-handoff.cs -- dump "codex://threads/<thread-id>"
 dotnet run --file codex-thread-handoff.cs -- dump .\handoff-<thread-id>.json
 ```
 
-別の作業ディレクトリから実行するときは、artifact の `source.reread.dumpFromDeeplink` にある絶対パスを使います。`dump` は、そのコマンドを実行する OS ユーザーの Codex 保存先を読みます。`CODEX_HOME` が設定されていればそのディレクトリ、無ければそのユーザーの既定ディレクトリです。別のマシンや別ユーザーの保存先は読めません。`repository.cwd` は対象リポジトリであり、ツールの場所でも thread の保存先でもありません。
+別の作業ディレクトリから実行するときは、artifact の `source.reread.dumpFromDeeplink` を PowerShell に貼ります。引数は単一引用符で囲んであり、`$` や部分式は展開されません。`dump` は、そのコマンドを実行する OS ユーザーの Codex 保存先を読みます。`CODEX_HOME` が設定されていればそのディレクトリ、無ければそのユーザーの既定ディレクトリです。別のマシンや別ユーザーの保存先は読めません。`repository.cwd` は対象リポジトリであり、ツールの場所でも thread の保存先でもありません。
 
 `dump` は要約を再生成しません。要約入力で省略した古い turn と、長い user / agent message の全文を stdout の filtered transcript に戻します。tool output、command output、diff 本文は戻しません。API key は不要です。
 
