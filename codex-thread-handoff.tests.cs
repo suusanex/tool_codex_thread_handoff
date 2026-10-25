@@ -19,6 +19,9 @@ await Test(failures, "malformed deeplink", MalformedDeeplink);
 await Test(failures, "api key resolution", ApiKeyResolution);
 await Test(failures, "final agent message and excluded tool output", FilterMessages);
 await Test(failures, "long transcript bound", LongTranscript);
+await Test(failures, "dump recovers summary omissions", DumpRecoversSummaryOmissions);
+await Test(failures, "reread names tool and codex environment", RereadNamesToolAndCodexEnvironment);
+await Test(failures, "codex launch resolution", CodexLaunchResolution);
 await Test(failures, "schema acceptance and rejection", Schema);
 await Test(failures, "git snapshot enters prompt and artifact", GitSnapshot);
 await Test(failures, "missing repository still creates handoff", MissingRepository);
@@ -117,6 +120,33 @@ static Task FilterMessages()
 
 static Task LongTranscript()
 {
+    var items = LongItems();
+    var filtered = TranscriptFilter.Filter(items);
+    var rendered = string.Join("\n", filtered.Messages.Select(message => message.Text));
+    AssertDoesNotContain(rendered, "TURN-00-");
+    AssertContains(rendered, "TURN-29-");
+    AssertDoesNotContain(rendered, "END_SECRET");
+    AssertContains(rendered, "[truncated]");
+    AssertDoesNotContain(rendered, "SECRET_TOOL_OUTPUT");
+    AssertEqual(true, filtered.Coverage.Truncated);
+    AssertEqual(31, filtered.Coverage.TurnCount);
+    AssertEqual(true, filtered.Coverage.IncludedTurnCount < filtered.Coverage.TurnCount);
+    var total = filtered.Messages.Sum(message => message.Text.Length);
+    AssertEqual(true, total <= TranscriptFilter.MaxTranscriptChars);
+
+    var recovered = TranscriptFilter.Filter(items, boundForSummary: false);
+    var recoveredText = string.Join("\n", recovered.Messages.Select(message => message.Text));
+    AssertContains(recoveredText, "TURN-00-");
+    AssertContains(recoveredText, "END_SECRET");
+    AssertDoesNotContain(recoveredText, "SECRET_TOOL_OUTPUT");
+    AssertDoesNotContain(recoveredText, "[truncated]");
+    AssertEqual(false, recovered.Coverage.Truncated);
+    AssertEqual(31, recovered.Coverage.IncludedTurnCount);
+    return Task.CompletedTask;
+}
+
+static List<StoredItem> LongItems()
+{
     var items = new List<StoredItem>();
     for (var i = 0; i < 30; i++)
     {
@@ -125,19 +155,154 @@ static Task LongTranscript()
         items.Add(new StoredItem($"t{i}", User(text, null)));
     }
 
+    items.Add(new StoredItem("t0", """{"type":"commandExecution","aggregatedOutput":"SECRET_TOOL_OUTPUT"}"""));
     var huge = "START-" + new string('y', 9_000) + "-END_SECRET";
     items.Add(new StoredItem("t30", User(huge, null)));
-    var filtered = TranscriptFilter.Filter(items);
-    var rendered = string.Join("\n", filtered.Messages.Select(message => message.Text));
-    AssertDoesNotContain(rendered, "TURN-00-");
-    AssertContains(rendered, "TURN-29-");
-    AssertDoesNotContain(rendered, "END_SECRET");
-    AssertContains(rendered, "[truncated]");
-    AssertEqual(true, filtered.Coverage.Truncated);
-    AssertEqual(31, filtered.Coverage.TurnCount);
-    AssertEqual(true, filtered.Coverage.IncludedTurnCount < filtered.Coverage.TurnCount);
-    var total = filtered.Messages.Sum(message => message.Text.Length);
-    AssertEqual(true, total <= TranscriptFilter.MaxTranscriptChars);
+    return items;
+}
+
+static async Task DumpRecoversSummaryOmissions()
+{
+    var threads = new FakeThreads(new ThreadSnapshot("threadA", null, null, LongItems()));
+    var stdout = new StringWriter();
+    var exit = await Cli.RunAsync(
+        ["dump", "codex://threads/threadA"],
+        _ => null,
+        threads,
+        new FakeModel(),
+        stdout,
+        new StringWriter(),
+        CancellationToken.None);
+    AssertEqual(0, exit);
+    using var document = JsonDocument.Parse(stdout.ToString());
+    var texts = string.Join("\n", document.RootElement.GetProperty("messages").EnumerateArray().Select(message => message.GetProperty("text").GetString()));
+    AssertContains(texts, "TURN-00-");
+    AssertContains(texts, "END_SECRET");
+    AssertDoesNotContain(texts, "SECRET_TOOL_OUTPUT");
+    AssertDoesNotContain(texts, "[truncated]");
+    AssertEqual(false, document.RootElement.GetProperty("coverage").GetProperty("truncated").GetBoolean());
+    AssertEqual("commandExecution", string.Join(",", document.RootElement.GetProperty("coverage").GetProperty("excludedItemTypes").EnumerateArray().Select(item => item.GetString())));
+}
+
+static async Task RereadNamesToolAndCodexEnvironment()
+{
+    var model = new FakeModel();
+    var threads = new FakeThreads(new ThreadSnapshot("abc", null, null, [new StoredItem("t1", User("continue", null))]));
+    var output = Path.Combine(Path.GetTempPath(), $"handoff test {Guid.NewGuid():N}.json");
+    var entry = Path.Combine(Path.GetTempPath(), "tool dir", "codex-thread-handoff.cs");
+    var fullEntry = Path.GetFullPath(entry);
+    var fullOutput = Path.GetFullPath(output);
+    try
+    {
+        var exit = await Cli.RunAsync(
+            ["codex://threads/abc", "-o", output],
+            _ => "dedicated",
+            threads,
+            model,
+            new StringWriter(),
+            new StringWriter(),
+            CancellationToken.None,
+            entry);
+        AssertEqual(0, exit);
+        using var known = JsonDocument.Parse(await File.ReadAllTextAsync(output));
+        var reread = known.RootElement.GetProperty("source").GetProperty("reread");
+        AssertContains(reread.GetProperty("codexEnvironment").GetString()!, "CODEX_HOME");
+        AssertContains(reread.GetProperty("codexEnvironment").GetString()!, "別のマシン");
+        AssertContains(reread.GetProperty("toolLocation").GetString()!, fullEntry);
+        AssertContains(reread.GetProperty("toolLocation").GetString()!, ArtifactBuilder.RepositoryUrl);
+        var dumpDeeplink = reread.GetProperty("dumpFromDeeplink").GetString()!;
+        var dumpFile = reread.GetProperty("dumpFromHandoffJson").GetString()!;
+        AssertContains(dumpDeeplink, $"\"{fullEntry}\"");
+        AssertContains(dumpDeeplink, "codex://threads/abc");
+        AssertContains(dumpFile, $"\"{fullEntry}\"");
+        AssertContains(dumpFile, $"\"{fullOutput}\"");
+        File.Delete(output);
+
+        var fallbackOutput = Path.Combine(Path.GetTempPath(), $"handoff-fallback-{Guid.NewGuid():N}.json");
+        var fallbackExit = await Cli.RunAsync(
+            ["codex://threads/abc", "-o", fallbackOutput],
+            _ => "dedicated",
+            threads,
+            model,
+            new StringWriter(),
+            new StringWriter(),
+            CancellationToken.None);
+        AssertEqual(0, fallbackExit);
+        using var unknown = JsonDocument.Parse(await File.ReadAllTextAsync(fallbackOutput));
+        var fallback = unknown.RootElement.GetProperty("source").GetProperty("reread");
+        AssertContains(fallback.GetProperty("toolLocation").GetString()!, "記録されていません");
+        AssertContains(fallback.GetProperty("toolLocation").GetString()!, ArtifactBuilder.RepositoryUrl);
+        AssertContains(fallback.GetProperty("dumpFromDeeplink").GetString()!, "--file codex-thread-handoff.cs --");
+        File.Delete(fallbackOutput);
+    }
+    finally
+    {
+        if (File.Exists(output))
+        {
+            File.Delete(output);
+        }
+    }
+}
+
+static Task CodexLaunchResolution()
+{
+    var nativeName = OperatingSystem.IsWindows() ? "codex.exe" : "codex";
+    var js = Path.Combine("early", "node_modules", "@openai", "codex", "bin", "codex.js");
+    var native = Path.Combine("late", nativeName);
+    var jsFirst = CodexLaunchResolver.Resolve(
+        $"early{Path.PathSeparator}late",
+        path => path == native,
+        path => path == js);
+    AssertEqual("node", jsFirst.FileName);
+    AssertEqual(js, jsFirst.Arguments[0]);
+    AssertEqual("app-server", jsFirst.Arguments[1]);
+
+    var nativeFirst = CodexLaunchResolver.Resolve(
+        $"late{Path.PathSeparator}early",
+        path => path == native,
+        path => path == js);
+    AssertEqual(native, nativeFirst.FileName);
+    AssertEqual("app-server", nativeFirst.Arguments[0]);
+
+    var sameDirectoryNative = Path.Combine("both", nativeName);
+    var sameDirectoryJs = Path.Combine("both", "node_modules", "@openai", "codex", "bin", "codex.js");
+    var sameDirectory = CodexLaunchResolver.Resolve(
+        "both",
+        path => path == sameDirectoryNative,
+        path => path == sameDirectoryJs);
+    AssertEqual(sameDirectoryNative, sameDirectory.FileName);
+
+    AssertThrows("missing", () => CodexLaunchResolver.Resolve("shim-only", _ => false, _ => false));
+
+    var directory = Path.Combine(Path.GetTempPath(), $"codex-launch-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var script = Path.Combine(directory, "codex");
+        File.WriteAllText(script, "#!/usr/bin/env node\n");
+        var command = Path.Combine(directory, "codex.cmd");
+        File.WriteAllText(command, "@echo off\r\n");
+        AssertEqual(false, CodexLaunchResolver.IsDirectlyExecutable(command));
+        if (OperatingSystem.IsWindows())
+        {
+            AssertEqual(false, CodexLaunchResolver.IsDirectlyExecutable(script));
+            File.WriteAllBytes(script, [(byte)'M', (byte)'Z', 0, 0]);
+            AssertEqual(true, CodexLaunchResolver.IsDirectlyExecutable(script));
+        }
+        else
+        {
+            AssertEqual(true, CodexLaunchResolver.IsDirectlyExecutable(script));
+        }
+
+        var exe = Path.Combine(directory, "codex.exe");
+        File.WriteAllBytes(exe, [(byte)'M', (byte)'Z']);
+        AssertEqual(OperatingSystem.IsWindows(), CodexLaunchResolver.IsDirectlyExecutable(exe));
+    }
+    finally
+    {
+        DeleteDirectory(directory);
+    }
+
     return Task.CompletedTask;
 }
 
@@ -278,7 +443,7 @@ static async Task DumpBothInputs()
             "codex://threads/other-deeplink-ignored",
             "threadA",
             "title",
-            new RereadInfo("human", "dump-deeplink", "dump-file")),
+            new RereadInfo("human", "same Codex home", "tool location", "dump-deeplink", "dump-file")),
         null,
         SampleBody(),
         new CoverageInfo([], [], 0, 0, false, ""),
