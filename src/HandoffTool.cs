@@ -1,5 +1,6 @@
 using System.ClientModel;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -118,7 +119,11 @@ internal static class TranscriptFilter
     public const int MaxTranscriptChars = 120_000;
     private const string TruncationSuffix = "\n[truncated]";
 
-    public static FilteredTranscript Filter(IReadOnlyList<StoredItem> items)
+    // 要約入力だけ文字数で切る。dump は同じ user / agent 選択のまま、省略された本文を戻す。
+    public static FilteredTranscript Filter(IReadOnlyList<StoredItem> items) =>
+        Filter(items, boundForSummary: true);
+
+    public static FilteredTranscript Filter(IReadOnlyList<StoredItem> items, bool boundForSummary)
     {
         var turns = GroupTurns(items);
         var renderedTurns = new List<RenderedTurn>(turns.Count);
@@ -159,7 +164,7 @@ internal static class TranscriptFilter
                         text += $"[images omitted: {user.ImageCount}]";
                     }
 
-                    messages.Add(new TranscriptMessage(turn.TurnId, "user", Clip(text, ref messageTruncated)));
+                    messages.Add(new TranscriptMessage(turn.TurnId, "user", BoundText(text, boundForSummary, ref messageTruncated)));
                     includedTypes.Add("userMessage");
                     continue;
                 }
@@ -178,7 +183,7 @@ internal static class TranscriptFilter
                         continue;
                     }
 
-                    messages.Add(new TranscriptMessage(turn.TurnId, "assistant", Clip(text, ref messageTruncated)));
+                    messages.Add(new TranscriptMessage(turn.TurnId, "assistant", BoundText(text, boundForSummary, ref messageTruncated)));
                     includedTypes.Add("agentMessage");
                     continue;
                 }
@@ -192,9 +197,21 @@ internal static class TranscriptFilter
             }
         }
 
-        var kept = SelectNewest(renderedTurns, out var droppedTurns, out var clippedNewestTurn);
-        var notes = new StringBuilder(
-            "Default model input keeps user text and the final agent message in each turn. Tool output, command output, and diff bodies are excluded.");
+        List<TranscriptMessage> kept;
+        var droppedTurns = 0;
+        var clippedNewestTurn = false;
+        if (boundForSummary)
+        {
+            kept = SelectNewest(renderedTurns, out droppedTurns, out clippedNewestTurn);
+        }
+        else
+        {
+            kept = renderedTurns.SelectMany(turn => turn.Messages).ToList();
+        }
+
+        var notes = new StringBuilder(boundForSummary
+            ? "Default model input keeps user text and the final agent message in each turn. Tool output, command output, and diff bodies are excluded."
+            : "Dump keeps full user text and the final agent message in each turn, without the summary character limits. Tool output, command output, and diff bodies are excluded.");
         if (skippedAgentMessages > 0)
         {
             notes.Append($" Skipped {skippedAgentMessages} non-final agent messages.");
@@ -340,6 +357,9 @@ internal static class TranscriptFilter
 
         return (builder.ToString(), images);
     }
+
+    private static string BoundText(string text, bool boundForSummary, ref bool truncated) =>
+        boundForSummary ? Clip(text, ref truncated) : text;
 
     private static string Clip(string text, ref bool truncated)
     {
@@ -792,6 +812,8 @@ internal static class HandoffBodyParser
 
 internal sealed record RereadInfo(
     [property: JsonPropertyName("human")] string Human,
+    [property: JsonPropertyName("codexEnvironment")] string CodexEnvironment,
+    [property: JsonPropertyName("toolLocation")] string ToolLocation,
     [property: JsonPropertyName("dumpFromDeeplink")] string DumpFromDeeplink,
     [property: JsonPropertyName("dumpFromHandoffJson")] string DumpFromHandoffJson);
 
@@ -811,18 +833,39 @@ internal sealed record HandoffArtifact(
 
 internal static class ArtifactBuilder
 {
+    public const string RepositoryUrl = "https://github.com/suusanex/tool_codex_thread_handoff";
+
     public const string HumanReread =
         "Open the deeplink in the Codex GUI. Codex GUI で deeplink を開くと元 thread を確認できます。";
+
+    public const string CodexEnvironment =
+        "Run dump as the same OS user on the machine that stores the Codex thread. The tool reads CODEX_HOME when it is set, otherwise that user's default Codex data directory. repository.cwd is the thread project, not the tool location and not the thread store. Another machine cannot read the thread. 同じ OS ユーザーのマシンで dump を実行してください。CODEX_HOME が設定されていればその保存先を、無ければそのユーザーの既定 Codex データディレクトリを読みます。repository.cwd は対象リポジトリであり、ツールの場所でも thread の保存先でもありません。別のマシンからは元 thread を読めません。";
+
+    public static string DescribeToolLocation(string? toolEntryFile)
+    {
+        if (string.IsNullOrWhiteSpace(toolEntryFile))
+        {
+            return $"Entry file was not recorded. Clone {RepositoryUrl} and run codex-thread-handoff.cs from that checkout. 入口ファイルの絶対パスは記録されていません。{RepositoryUrl} を取得し、その中の codex-thread-handoff.cs を実行してください。";
+        }
+
+        var fullPath = Path.GetFullPath(toolEntryFile);
+        return $"Entry file: {fullPath}. Source repository: {RepositoryUrl}. Run dump with --file set to this entry file; the working directory can be another repository. 入口ファイルは {fullPath} です。作業ディレクトリが別リポジトリでも、--file にこの絶対パスを指定して dump を実行します。取得元は {RepositoryUrl} の codex-thread-handoff.cs です。";
+    }
 
     public static HandoffArtifact Build(
         ThreadSnapshot thread,
         HandoffBody body,
         RepositoryCapture repository,
         FilteredTranscript transcript,
-        string outputPath)
+        string outputPath,
+        string? toolEntryFile)
     {
         var deeplink = DeeplinkParser.ToDeeplink(thread.ThreadId);
-        var quotedPath = outputPath.Contains(' ', StringComparison.Ordinal) ? $"\"{outputPath}\"" : outputPath;
+        var entryArgument = string.IsNullOrWhiteSpace(toolEntryFile)
+            ? "codex-thread-handoff.cs"
+            : Path.GetFullPath(toolEntryFile);
+        var quotedEntry = QuoteCommandArgument(entryArgument);
+        var quotedOutput = QuoteCommandArgument(Path.GetFullPath(outputPath));
         return new HandoffArtifact(
             "1",
             new SourceInfo(
@@ -831,12 +874,24 @@ internal static class ArtifactBuilder
                 thread.Title,
                 new RereadInfo(
                     HumanReread,
-                    $"dotnet run --file codex-thread-handoff.cs -- dump {deeplink}",
-                    $"dotnet run --file codex-thread-handoff.cs -- dump {quotedPath}")),
+                    CodexEnvironment,
+                    DescribeToolLocation(toolEntryFile),
+                    $"dotnet run --file {quotedEntry} -- dump {deeplink}",
+                    $"dotnet run --file {quotedEntry} -- dump {quotedOutput}")),
             repository.Snapshot,
             body,
             transcript.Coverage,
             repository.Warnings);
+    }
+
+    private static string QuoteCommandArgument(string value)
+    {
+        if (value.IndexOfAny([' ', '\t', '"']) < 0)
+        {
+            return value;
+        }
+
+        return "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
     }
 }
 
@@ -953,6 +1008,8 @@ internal static class JsonText
         writer.WritePropertyName("reread");
         writer.WriteStartObject();
         writer.WriteString("human", source.Reread.Human);
+        writer.WriteString("codexEnvironment", source.Reread.CodexEnvironment);
+        writer.WriteString("toolLocation", source.Reread.ToolLocation);
         writer.WriteString("dumpFromDeeplink", source.Reread.DumpFromDeeplink);
         writer.WriteString("dumpFromHandoffJson", source.Reread.DumpFromHandoffJson);
         writer.WriteEndObject();
@@ -1033,7 +1090,8 @@ internal static class HandoffWorkflow
         string apiKey,
         IThreadSource threads,
         IHandoffModel handoffModel,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? toolEntryFile = null)
     {
         var snapshot = await threads.ReadAsync(threadId, cancellationToken);
         if (!string.Equals(snapshot.ThreadId, threadId, StringComparison.Ordinal))
@@ -1045,7 +1103,7 @@ internal static class HandoffWorkflow
         var repository = await GitSnapshotCollector.CaptureAsync(snapshot.Cwd, cancellationToken);
         var prompt = PromptBuilder.Build(transcript, snapshot.Title, repository);
         var body = await handoffModel.CreateAsync(model, apiKey, prompt, cancellationToken);
-        return ArtifactBuilder.Build(snapshot, body, repository, transcript, outputPath);
+        return ArtifactBuilder.Build(snapshot, body, repository, transcript, outputPath, toolEntryFile);
     }
 
     public static async Task<DumpDocument> DumpAsync(
@@ -1059,7 +1117,7 @@ internal static class HandoffWorkflow
             throw new HandoffException($"Thread source returned '{snapshot.ThreadId}' for requested thread '{threadId}'.");
         }
 
-        return DumpBuilder.Build(threadId, TranscriptFilter.Filter(snapshot.Items));
+        return DumpBuilder.Build(threadId, TranscriptFilter.Filter(snapshot.Items, boundForSummary: false));
     }
 }
 
@@ -1453,10 +1511,10 @@ internal sealed class CodexAppServerThreadSource : IThreadSource
 
     public async Task<ThreadSnapshot> ReadAsync(string threadId, CancellationToken cancellationToken)
     {
-        var jsPath = FindCodexJs();
+        var launch = CodexLaunchResolver.ResolveFromPath(Environment.GetEnvironmentVariable("PATH"));
         var start = new ProcessStartInfo
         {
-            FileName = "node",
+            FileName = launch.FileName,
             WorkingDirectory = Directory.GetCurrentDirectory(),
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -1467,8 +1525,10 @@ internal sealed class CodexAppServerThreadSource : IThreadSource
             StandardOutputEncoding = JsonLineEncoding,
             StandardErrorEncoding = JsonLineEncoding,
         };
-        start.ArgumentList.Add(jsPath);
-        start.ArgumentList.Add("app-server");
+        foreach (var argument in launch.Arguments)
+        {
+            start.ArgumentList.Add(argument);
+        }
 
         using var process = new Process { StartInfo = start };
         try
@@ -1534,19 +1594,117 @@ internal sealed class CodexAppServerThreadSource : IThreadSource
         }
     }
 
-    private static string FindCodexJs()
+}
+
+// CreateProcess は npm の .cmd / .ps1 / .bat を起動できない。
+// PATH の順に、直接実行できる codex を優先し、無ければ同じディレクトリの codex.js を node で起動する。
+// 後ろのディレクトリにある実行ファイルを、前にある js より優先しない。
+internal sealed record CodexLaunch(string FileName, IReadOnlyList<string> Arguments);
+
+internal static class CodexLaunchResolver
+{
+    public static CodexLaunch ResolveFromPath(string? pathVariable) =>
+        Resolve(pathVariable, IsDirectlyExecutable, File.Exists);
+
+    public static CodexLaunch Resolve(
+        string? pathVariable,
+        Func<string, bool> isDirectlyExecutable,
+        Func<string, bool> fileExists)
     {
-        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        foreach (var directory in PathDirectories(pathVariable))
         {
-            var js = Path.Combine(directory.Trim(), "node_modules", "@openai", "codex", "bin", "codex.js");
-            if (File.Exists(js))
+            foreach (var name in NativeFileNames())
             {
-                return js;
+                var candidate = Path.Combine(directory, name);
+                if (isDirectlyExecutable(candidate))
+                {
+                    return new CodexLaunch(candidate, ["app-server"]);
+                }
+            }
+
+            var js = Path.Combine(directory, "node_modules", "@openai", "codex", "bin", "codex.js");
+            if (fileExists(js))
+            {
+                return new CodexLaunch("node", [js, "app-server"]);
             }
         }
 
-        throw new HandoffException("Codex CLI was not found on PATH.");
+        throw new HandoffException(
+            "Codex CLI was not found on PATH. Install a native codex executable, or Node.js and the npm package @openai/codex so that node_modules/@openai/codex/bin/codex.js is next to a PATH entry. cmd, bat, and ps1 shims are not launched.");
+    }
+
+    internal static bool IsDirectlyExecutable(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        var extension = Path.GetExtension(path);
+        if (extension.Equals(".cmd", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".bat", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".ps1", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return extension.Length == 0;
+        }
+
+        if (extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".com", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (extension.Length != 0)
+        {
+            return false;
+        }
+
+        return HasPeHeader(path);
+    }
+
+    private static bool HasPeHeader(string path)
+    {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            var header = new byte[2];
+            return stream.Read(header, 0, 2) == 2 && header[0] == (byte)'M' && header[1] == (byte)'Z';
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static IEnumerable<string> NativeFileNames()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            yield return "codex.exe";
+            yield return "codex.com";
+            yield return "codex";
+        }
+        else
+        {
+            yield return "codex";
+        }
+    }
+
+    private static IEnumerable<string> PathDirectories(string? pathVariable)
+    {
+        foreach (var raw in (pathVariable ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var directory = raw.Trim().Trim('"');
+            if (directory.Length > 0)
+            {
+                yield return directory;
+            }
+        }
     }
 }
 
@@ -1664,8 +1822,8 @@ internal static class Cli
 {
     public const string DefaultModel = "gpt-6-luna";
 
-    public static Task<int> RunAsync(string[] args) =>
-        RunAsync(args, Environment.GetEnvironmentVariable, new CodexAppServerThreadSource(), new OpenAiHandoffModel(), Console.Out, Console.Error, CancellationToken.None);
+    public static Task<int> RunAsync(string[] args, [CallerFilePath] string toolEntryFile = "") =>
+        RunAsync(args, Environment.GetEnvironmentVariable, new CodexAppServerThreadSource(), new OpenAiHandoffModel(), Console.Out, Console.Error, CancellationToken.None, toolEntryFile);
 
     internal static async Task<int> RunAsync(
         string[] args,
@@ -1674,7 +1832,8 @@ internal static class Cli
         IHandoffModel model,
         TextWriter stdout,
         TextWriter stderr,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? toolEntryFile = null)
     {
         try
         {
@@ -1703,7 +1862,8 @@ internal static class Cli
                 apiKey,
                 threads,
                 model,
-                cancellationToken);
+                cancellationToken,
+                toolEntryFile);
             await File.WriteAllTextAsync(outputPath, JsonText.Serialize(artifact), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
             foreach (var warning in artifact.Warnings)
             {
