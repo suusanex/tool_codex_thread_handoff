@@ -21,6 +21,7 @@ await Test(failures, "final agent message and excluded tool output", FilterMessa
 await Test(failures, "long transcript bound", LongTranscript);
 await Test(failures, "dump recovers summary omissions", DumpRecoversSummaryOmissions);
 await Test(failures, "reread names tool and codex environment", RereadNamesToolAndCodexEnvironment);
+await Test(failures, "powershell dump arguments stay literal", PowerShellDumpArgumentsStayLiteral);
 await Test(failures, "codex launch resolution", CodexLaunchResolution);
 await Test(failures, "schema acceptance and rejection", Schema);
 await Test(failures, "git snapshot enters prompt and artifact", GitSnapshot);
@@ -212,10 +213,11 @@ static async Task RereadNamesToolAndCodexEnvironment()
         AssertContains(reread.GetProperty("toolLocation").GetString()!, ArtifactBuilder.RepositoryUrl);
         var dumpDeeplink = reread.GetProperty("dumpFromDeeplink").GetString()!;
         var dumpFile = reread.GetProperty("dumpFromHandoffJson").GetString()!;
-        AssertContains(dumpDeeplink, $"\"{fullEntry}\"");
-        AssertContains(dumpDeeplink, "codex://threads/abc");
-        AssertContains(dumpFile, $"\"{fullEntry}\"");
-        AssertContains(dumpFile, $"\"{fullOutput}\"");
+        AssertContains(dumpDeeplink, ArtifactBuilder.QuotePowerShellLiteral(fullEntry));
+        AssertContains(dumpDeeplink, ArtifactBuilder.QuotePowerShellLiteral("codex://threads/abc"));
+        AssertContains(dumpFile, ArtifactBuilder.QuotePowerShellLiteral(fullEntry));
+        AssertContains(dumpFile, ArtifactBuilder.QuotePowerShellLiteral(fullOutput));
+        AssertContains(reread.GetProperty("toolLocation").GetString()!, "PowerShell");
         File.Delete(output);
 
         var fallbackOutput = Path.Combine(Path.GetTempPath(), $"handoff-fallback-{Guid.NewGuid():N}.json");
@@ -232,7 +234,7 @@ static async Task RereadNamesToolAndCodexEnvironment()
         var fallback = unknown.RootElement.GetProperty("source").GetProperty("reread");
         AssertContains(fallback.GetProperty("toolLocation").GetString()!, "記録されていません");
         AssertContains(fallback.GetProperty("toolLocation").GetString()!, ArtifactBuilder.RepositoryUrl);
-        AssertContains(fallback.GetProperty("dumpFromDeeplink").GetString()!, "--file codex-thread-handoff.cs --");
+        AssertContains(fallback.GetProperty("dumpFromDeeplink").GetString()!, "--file 'codex-thread-handoff.cs' --");
         File.Delete(fallbackOutput);
     }
     finally
@@ -242,6 +244,55 @@ static async Task RereadNamesToolAndCodexEnvironment()
             File.Delete(output);
         }
     }
+}
+
+static async Task PowerShellDumpArgumentsStayLiteral()
+{
+    var samples = new[]
+    {
+        @"C:\tool dir\codex-thread-handoff.cs",
+        "C:\\tool$'dir $(whoami)\\it's\\codex-thread-handoff.cs",
+    };
+    foreach (var sample in samples)
+    {
+        var script = Path.Combine(Path.GetTempPath(), $"quote-{Guid.NewGuid():N}.ps1");
+        await File.WriteAllTextAsync(script, "Write-Output " + ArtifactBuilder.QuotePowerShellLiteral(sample) + Environment.NewLine);
+        try
+        {
+            var actual = (await RunPwshAsync(script)).TrimEnd('\r', '\n');
+            AssertEqual(sample, actual);
+        }
+        finally
+        {
+            File.Delete(script);
+        }
+    }
+}
+
+static async Task<string> RunPwshAsync(string script)
+{
+    var start = new ProcessStartInfo
+    {
+        FileName = "pwsh",
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+    };
+    start.ArgumentList.Add("-NoProfile");
+    start.ArgumentList.Add("-File");
+    start.ArgumentList.Add(script);
+    using var process = Process.Start(start) ?? throw new InvalidOperationException("pwsh did not start.");
+    var stdoutTask = process.StandardOutput.ReadToEndAsync();
+    var stderrTask = process.StandardError.ReadToEndAsync();
+    await process.WaitForExitAsync();
+    var stderr = await stderrTask;
+    var stdout = await stdoutTask;
+    if (process.ExitCode != 0)
+    {
+        throw new InvalidOperationException(stderr);
+    }
+
+    return stdout;
 }
 
 static Task CodexLaunchResolution()
@@ -272,6 +323,16 @@ static Task CodexLaunchResolution()
         path => path == sameDirectoryJs);
     AssertEqual(sameDirectoryNative, sameDirectory.FileName);
 
+    var nonExecutableThenJs = CodexLaunchResolver.Resolve(
+        "both",
+        _ => false,
+        path => path == sameDirectoryJs);
+    AssertEqual("node", nonExecutableThenJs.FileName);
+    AssertEqual(sameDirectoryJs, nonExecutableThenJs.Arguments[0]);
+    AssertEqual(false, CodexLaunchResolver.HasAnyExecuteBit(UnixFileMode.UserRead | UnixFileMode.UserWrite));
+    AssertEqual(true, CodexLaunchResolver.HasAnyExecuteBit(UnixFileMode.UserExecute));
+    AssertEqual(true, CodexLaunchResolver.HasAnyExecuteBit(UnixFileMode.OtherExecute));
+
     AssertThrows("missing", () => CodexLaunchResolver.Resolve("shim-only", _ => false, _ => false));
 
     var directory = Path.Combine(Path.GetTempPath(), $"codex-launch-{Guid.NewGuid():N}");
@@ -291,7 +352,11 @@ static Task CodexLaunchResolution()
         }
         else
         {
+            AssertEqual(false, CodexLaunchResolver.IsDirectlyExecutable(script));
+            File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserExecute);
             AssertEqual(true, CodexLaunchResolver.IsDirectlyExecutable(script));
+            File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            AssertEqual(false, CodexLaunchResolver.IsDirectlyExecutable(script));
         }
 
         var exe = Path.Combine(directory, "codex.exe");
@@ -358,6 +423,8 @@ static async Task GitSnapshot()
         AssertEqual(0, exit);
         AssertEqual("gpt-test", model.Model);
         AssertEqual("test-key", model.ApiKey);
+        AssertContains(model.Prompt!, "may already be committed");
+        AssertDoesNotContain(model.Prompt!, "no such change");
         AssertContains(model.Prompt!, "tracked.txt");
         AssertContains(model.Prompt!, "git diff --stat:");
         AssertDoesNotContain(model.Prompt!, "UNIQUE_DIFF_BODY_LINE");

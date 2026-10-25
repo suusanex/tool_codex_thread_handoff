@@ -84,7 +84,7 @@ dotnet run --file codex-thread-handoff.cs -- dump "codex://threads/<thread-id>"
 
 - currentState: `handoff.currentState` を、`dump` の user / agent message が示す実施済み内容と比べる。空でなく、継続に必要な実施済み内容と現在状態が揃っていれば pass。会話と食い違う、または空なら fail。
 - openQuestions: `dump` 上で作業継続に重要な未決事項や risk があるとき、それが `handoff.openQuestions` に含まれていれば pass。重要なものが無ければ空配列で pass。見落としていれば fail。件数だけを備考に書いてよい。
-- Git 整合: `repository` が null のときは n/a とし、不合格にしない。オブジェクトのときは `dirty`、`statusShort`、`diffStat` をその場で見る。`dirty` が true、または status が空でないのに currentState が作業ツリーをきれいだと読める場合は fail。会話が実装済みと言い、status または diff stat では未コミットか該当変更が無い場合に、currentState がその食い違いを述べていなければ fail。それ以外は pass。status と diff stat の本文は記録しない。
+- Git 整合: `repository` が null のときは n/a とし、不合格にしない。オブジェクトのときは `dirty`、`statusShort`、`diffStat` をその場で見る。`dirty` が true、または status が空でないのに、会話上は完了している変更が未コミットであることを currentState が述べていなければ fail。作業ツリーがきれいであること、または status に path が無いことだけを根拠に、実装がリポジトリに無いと currentState が断定している場合も fail。未コミットではない、という範囲を超えて欠落を断定していなければ pass。status と diff stat の本文は記録しない。
 
 ### 期待結果と合否基準
 
