@@ -2208,12 +2208,7 @@ internal static class Cli
                 args,
                 Environment.GetEnvironmentVariable,
                 new CodexAppServerThreadSource(),
-                backend => backend.Backend switch
-                {
-                    HandoffBackend.OpenAi => new OpenAiHandoffModel(backend.ApiKey!),
-                    HandoffBackend.Facade => new FacadeHandoffModel(backend.FacadeCliPath!),
-                    _ => throw new HandoffException($"Unsupported backend '{backend.Backend}'."),
-                },
+                backend => CreateHandoffModel(backend),
                 Console.Out,
                 Console.Error,
                 cancellation.Token,
@@ -2224,6 +2219,18 @@ internal static class Cli
             Console.CancelKeyPress -= cancel;
         }
     }
+
+    internal static IHandoffModel CreateHandoffModel(
+        ResolvedBackend backend,
+        Func<string, string, CancellationToken, Task<FacadeProcessResult>>? runFacadeProcess = null) =>
+        backend.Backend switch
+        {
+            HandoffBackend.OpenAi => new OpenAiHandoffModel(backend.ApiKey!),
+            HandoffBackend.Facade => new FacadeHandoffModel(
+                backend.FacadeCliPath!,
+                runFacadeProcess),
+            _ => throw new HandoffException($"Unsupported backend '{backend.Backend}'."),
+        };
 
     internal static async Task<int> RunAsync(
         string[] args,
