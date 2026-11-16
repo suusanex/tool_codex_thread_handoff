@@ -6,6 +6,7 @@
 #:include src/HandoffTool.cs
 
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -21,6 +22,7 @@ await Test(failures, "backend and facade path parsing", BackendAndFacadePathPars
 await Test(failures, "facade request and response", FacadeRequestAndResponse);
 await Test(failures, "facade failures", FacadeFailures);
 await Test(failures, "facade cancellation and timeout", FacadeCancellationAndTimeout);
+await Test(failures, "facade real process I/O and cancellation", FacadeRealProcess);
 await Test(failures, "facade CLI does not require API key", FacadeCliDoesNotRequireApiKey);
 await Test(failures, "final agent message and excluded tool output", FilterMessages);
 await Test(failures, "long transcript bound", LongTranscript);
@@ -231,6 +233,79 @@ static async Task FacadeCancellationAndTimeout()
     var timeoutMessage = await CaptureHandoffExceptionAsync(() =>
         timeoutModel.CreateAsync("copilot-model", "prompt", directory, CancellationToken.None));
     AssertContains(timeoutMessage, "timed out after 1 seconds");
+}
+
+static async Task FacadeRealProcess()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"facade-process-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var previousMode = Environment.GetEnvironmentVariable("CODEX_THREAD_HANDOFF_TEST_STUB_MODE");
+    try
+    {
+        var executable = await PublishFacadeStubAsync(directory);
+        var model = new FacadeHandoffModel(executable, timeoutSeconds: 10);
+        Environment.SetEnvironmentVariable("CODEX_THREAD_HANDOFF_TEST_STUB_MODE", null);
+        var body = await model.CreateAsync(
+            "copilot-process-model",
+            "prompt",
+            Path.GetFullPath(Directory.GetCurrentDirectory()),
+            CancellationToken.None);
+        AssertContains(body.Purpose, "model=copilot-process-model");
+        AssertContains(body.Purpose, Path.GetFullPath(Directory.GetCurrentDirectory()));
+
+        Environment.SetEnvironmentVariable("CODEX_THREAD_HANDOFF_TEST_STUB_MODE", "wait");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        var cancellationMessage = await CaptureHandoffExceptionAsync(() =>
+            model.CreateAsync(
+                "copilot-process-model",
+                "prompt",
+                Path.GetFullPath(Directory.GetCurrentDirectory()),
+                cancellation.Token));
+        AssertContains(cancellationMessage, "cancelled");
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("CODEX_THREAD_HANDOFF_TEST_STUB_MODE", previousMode);
+        DeleteDirectory(directory);
+    }
+}
+
+static async Task<string> PublishFacadeStubAsync(string outputDirectory)
+{
+    var source = Path.GetFullPath("codex-thread-handoff.facade-stub.cs");
+    var start = new ProcessStartInfo
+    {
+        FileName = "dotnet",
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+    };
+    start.ArgumentList.Add("publish");
+    start.ArgumentList.Add(source);
+    start.ArgumentList.Add("-c");
+    start.ArgumentList.Add("Release");
+    start.ArgumentList.Add("-r");
+    start.ArgumentList.Add(RuntimeInformation.RuntimeIdentifier);
+    start.ArgumentList.Add("-p:PublishAot=false");
+    start.ArgumentList.Add("--self-contained");
+    start.ArgumentList.Add("false");
+    start.ArgumentList.Add("-o");
+    start.ArgumentList.Add(outputDirectory);
+    using var process = Process.Start(start) ?? throw new InvalidOperationException("dotnet publish did not start.");
+    var stdoutTask = process.StandardOutput.ReadToEndAsync();
+    var stderrTask = process.StandardError.ReadToEndAsync();
+    await process.WaitForExitAsync();
+    var stdout = await stdoutTask;
+    var stderr = await stderrTask;
+    if (process.ExitCode != 0)
+    {
+        throw new InvalidOperationException($"Facade stub publish failed with exit {process.ExitCode}.\n{stdout}\n{stderr}");
+    }
+
+    var fileName = OperatingSystem.IsWindows()
+        ? "codex-thread-handoff.facade-stub.exe"
+        : "codex-thread-handoff.facade-stub";
+    return Path.Combine(outputDirectory, fileName);
 }
 
 static FacadeProcessResult FacadeResult(string outputKind, string outputText) =>
