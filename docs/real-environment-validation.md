@@ -1,24 +1,27 @@
 # 実環境検証の申し送り
 
-この文書は、自動テストでは確認できない実環境検証の手順と、秘密情報を残さない結果の記録先です。現時点では未実施です。実 API 呼び出しや、長さの違う thread の圧縮品質が合格した記録ではありません。
+この文書は、自動テストでは確認できない実環境検証の手順と、秘密情報を残さない結果の記録先です。現時点では未実施です。実 API 呼び出し、実 Facade / GitHub Copilot CLI 呼び出し、長さの違う thread の圧縮品質が合格した記録ではありません。
 
 以前に、実 thread 1 件について App Server の metadata と `thread/items/list` の pagination が応答することだけを確認しました。その確認は要約を生成しておらず、この文書の検証 1 も検証 2 も満たしません。
 
 ## 未実施の理由
 
-個人の Codex thread 本文を OpenAI API に送り、その本文や handoff の文章をリポジトリへ残すことは、この実装作業の範囲外です。目的レビューで求められているのは実測値そのものではなく、未実施の検証を parent へ戻せる申し送りです。
+個人の Codex thread 本文を外部サービスへ送り、その本文や handoff の文章をリポジトリへ残すことは、この実装作業の範囲外です。目的レビューで求められているのは実測値そのものではなく、未実施の検証を parent へ戻せる申し送りです。
 
 ## 担当と実施時点
 
-担当はリポジトリ所有者（suusanex）です。要約品質を受け入れ可能と判断する前、および GitHub issue #1 を閉じる前に実施します。
+担当はリポジトリ所有者（suusanex）です。要約品質を受け入れ可能と判断する前、および GitHub issue #1 / #3 を閉じる前に実施します。
 
 ## 共通の環境
 
 - このリポジトリの作業ツリー
 - .NET SDK 11 以降と .NET 10 ランタイム
-- 環境変数 `CODEX_THREAD_HANDOFF_OPENAI_API_KEY`。値、リクエスト本文、応答本文は記録しない
 - 検証する thread を保存しているのと同じマシン、同じ OS ユーザー。別マシンの thread は使わない
 - Codex は PATH 上の直接実行できる `codex` / `codex.exe`、または npm 導入の `node_modules/@openai/codex/bin/codex.js`。後者だけ Node.js が必要
+
+OpenAI の検証では追加で環境変数 `CODEX_THREAD_HANDOFF_OPENAI_API_KEY` が必要です。値、リクエスト本文、応答本文は記録しません。
+
+Facade の検証では追加で publish 済み `CodexAgentFacadeCli.exe`、環境変数 `CODEX_THREAD_HANDOFF_FACADE_CLI`、PATH 上で login 済みの GitHub Copilot CLI、利用可能な Copilot model ID が必要です。OpenAI API key と `CODEX_AGENT_FACADE_TOKEN` は設定しません。
 
 ## 検証 1: 実 API で handoff を生成する
 
@@ -102,6 +105,38 @@ dotnet run --file codex-thread-handoff.cs -- dump "codex://threads/<thread-id>"
 
 記録してよいのは pass / fail / n/a、`coverage` のフラグと件数、thread id、`input_tokens` の整数、openQuestions の件数だけである。
 
+## 検証 3: Facade + GitHub Copilot で handoff を生成する
+
+### 対象要件
+
+OpenAI API key を設定しない環境で、publish 済み Facade CLI と login 済み GitHub Copilot CLI を使い、指定した model から既存 artifact と同じ形の handoff JSON を生成する。
+
+### 操作
+
+1. `CODEX_THREAD_HANDOFF_OPENAI_API_KEY` と `CODEX_AGENT_FACADE_TOKEN` を設定しない。Facade CLI のフルパス、GitHub Copilot CLI の PATH、login、利用可能 model ID を確認する。
+2. `CODEX_THREAD_HANDOFF_FACADE_CLI` だけを設定して生成する。
+
+```powershell
+$env:CODEX_THREAD_HANDOFF_FACADE_CLI = "D:\path\to\CodexAgentFacadeCli.exe"
+dotnet run --file codex-thread-handoff.cs -- "codex://threads/<thread-id>" --backend facade --model <copilot-model-id> -o $env:TEMP\handoff-facade-check.json
+```
+
+3. 生成された JSON をその場で読み、「主要成果の評価」と同じ内容品質を確認する。thread 本文、handoff の文章、Copilot の応答本文、run log、キーは記録しない。確認後、出力ファイルは削除する。
+4. `--facade-cli` へ同じ exe を直接指定して、環境変数設定より引数が優先されることを一度確認する。環境変数には意図的に存在しないフルパスを設定し、引数指定版が成功することを見る。成功後、元の環境変数を復元する。
+5. 存在しない `--facade-cli` では thread source を呼ばず、識別可能な path error で exit code 1 になることを確認する。
+
+### 期待結果と合否基準
+
+合格は次をすべて満たすこと。
+
+- `--backend facade` は OpenAI API key を要求せず、exit code 0 になる
+- `schemaVersion`、`source`、`repository`、`handoff`、`coverage`、`warnings` の構造が OpenAI 版と同じ
+- 生成 JSON と「主要成果の評価」の内容が元 thread と合う
+- `--facade-cli` が環境変数より優先される
+- path 不正では JSON artifact を作らず、原因を示して停止する
+- Facade の completed 以外、`final_response` 以外、空または schema に合わない body を成功扱いせず artifact を保存しない
+- model は指定した Copilot model ID のまま使われ、別 model / OpenAI への fallback は記録されない
+
 ## 結果の記録先
 
 結果はこのファイルの「結果」へ追記する。秘密情報、transcript、handoff の文章、API key、status、diff 本文は残さない。生成した handoff JSON はコミットしない。token 数はログから写した整数だけを残す。
@@ -115,6 +150,7 @@ dotnet run --file codex-thread-handoff.cs -- dump "codex://threads/<thread-id>"
 | 1 実 API |  |  | 未実施 |  |  |  |  |  |  |
 | 2 短い thread |  |  | 未実施 |  |  |  |  |  |  |
 | 2 長い thread |  |  | 未実施 |  |  |  |  |  |  |
+| 3 Facade + Copilot |  |  | 未実施 |  | n/a |  |  |  |  |
 
 ## 失敗時に parent の修正へ戻す手順
 
