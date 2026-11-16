@@ -17,6 +17,10 @@ await Test(failures, "bare deeplink", BareDeeplink);
 await Test(failures, "markdown deeplink", MarkdownDeeplink);
 await Test(failures, "malformed deeplink", MalformedDeeplink);
 await Test(failures, "api key resolution", ApiKeyResolution);
+await Test(failures, "backend and facade path parsing", BackendAndFacadePathParsing);
+await Test(failures, "facade request and response", FacadeRequestAndResponse);
+await Test(failures, "facade failures", FacadeFailures);
+await Test(failures, "facade CLI does not require API key", FacadeCliDoesNotRequireApiKey);
 await Test(failures, "final agent message and excluded tool output", FilterMessages);
 await Test(failures, "long transcript bound", LongTranscript);
 await Test(failures, "dump recovers summary omissions", DumpRecoversSummaryOmissions);
@@ -85,6 +89,205 @@ static Task ApiKeyResolution()
     AssertThrows("generic only", () => ApiKeyResolver.Resolve(name => name == "OPENAI_API_KEY" ? "generic" : null));
     AssertEqual("dedicated", ApiKeyResolver.Resolve(name => name == ApiKeyResolver.VariableName ? " dedicated " : "generic"));
     return Task.CompletedTask;
+}
+
+static Task BackendAndFacadePathParsing()
+{
+    var openAi = CliParser.Parse(["codex://threads/abc"]);
+    AssertEqual(HandoffBackend.OpenAi, openAi.Backend);
+    AssertEqual(false, openAi.BackendSpecified);
+
+    var facade = CliParser.Parse(
+        ["codex://threads/abc", "--backend", "facade", "--model", "copilot-model", "--facade-cli", "override"]);
+    AssertEqual(HandoffBackend.Facade, facade.Backend);
+    AssertEqual("copilot-model", facade.Model!);
+    AssertEqual("override", facade.FacadeCliPath!);
+
+    AssertThrows("facade model", () => CliParser.Parse(["codex://threads/abc", "--backend", "facade"]));
+    AssertThrows("backend", () => CliParser.Parse(["codex://threads/abc", "--backend", "other"]));
+    AssertThrows("unused facade path", () => CliParser.Parse(["codex://threads/abc", "--facade-cli", "ignored"]));
+    AssertThrows("dump backend", () => CliParser.Parse(["dump", "codex://threads/abc", "--backend", "facade"]));
+
+    var directory = Path.Combine(Path.GetTempPath(), $"facade-path-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var configured = Path.Combine(directory, "configured.exe");
+        var overridePath = Path.Combine(directory, "override.exe");
+        File.WriteAllText(configured, "");
+        File.WriteAllText(overridePath, "");
+        AssertEqual(overridePath, FacadeCliPathResolver.Resolve(overridePath, _ => configured));
+        AssertEqual(configured, FacadeCliPathResolver.Resolve(null, name =>
+            name == FacadeCliPathResolver.VariableName ? configured : null));
+        AssertThrows("missing", () => FacadeCliPathResolver.Resolve(null, _ => null));
+        AssertThrows("relative", () => FacadeCliPathResolver.Resolve("relative.exe", _ => null));
+        AssertThrows(
+            "not found",
+            () => FacadeCliPathResolver.Resolve(Path.Combine(directory, "missing.exe"), _ => null));
+    }
+    finally
+    {
+        DeleteDirectory(directory);
+    }
+
+    return Task.CompletedTask;
+}
+
+static async Task FacadeRequestAndResponse()
+{
+    string? capturedPath = null;
+    string? capturedRequest = null;
+    var bodyJson = """
+        {"purpose":"目的","decisions":[],"currentState":["完了"],"remainingWork":[],"rejectedApproaches":[],"openQuestions":[],"importantFiles":["src/HandoffTool.cs"]}
+        """;
+    var response = new JsonObject
+    {
+        ["status"] = "completed",
+        ["result"] = new JsonObject
+        {
+            ["agent"] = "github-copilot",
+            ["outputKind"] = "final_response",
+            ["outputText"] = bodyJson,
+        },
+    }.ToJsonString();
+    var model = new FacadeHandoffModel("C:\\Tools\\CodexAgentFacadeCli.exe", (path, request, cancellationToken) =>
+    {
+        capturedPath = path;
+        capturedRequest = request;
+        return Task.FromResult(new FacadeProcessResult(0, response, ""));
+    });
+    var directory = Path.GetFullPath(Directory.GetCurrentDirectory());
+
+    var body = await model.CreateAsync("copilot-model", "FILTERED_INPUT", directory, CancellationToken.None);
+
+    AssertEqual("目的", body.Purpose);
+    AssertEqual("src/HandoffTool.cs", body.ImportantFiles[0]);
+    AssertEqual("C:\\Tools\\CodexAgentFacadeCli.exe", capturedPath!);
+    using var document = JsonDocument.Parse(capturedRequest!);
+    var root = document.RootElement;
+    AssertEqual("github-copilot", root.GetProperty("agent").GetString()!);
+    AssertEqual("copilot-model", root.GetProperty("model").GetString()!);
+    AssertEqual(directory, root.GetProperty("working_directory").GetString()!);
+    AssertEqual(false, root.GetProperty("auto_approve").GetBoolean());
+    AssertContains(root.GetProperty("prompt").GetString()!, HandoffBodyParser.SchemaJson);
+    AssertContains(root.GetProperty("prompt").GetString()!, "FILTERED_INPUT");
+    AssertContains(root.GetProperty("prompt").GetString()!, "Do not call tools or edit files.");
+    AssertEqual(false, root.TryGetProperty("skills", out _));
+    AssertEqual(false, root.TryGetProperty("run_mode", out _));
+    AssertEqual(false, root.TryGetProperty("session_id", out _));
+}
+
+static async Task FacadeFailures()
+{
+    var directory = Path.GetFullPath(Directory.GetCurrentDirectory());
+    var validBody = """
+        {"purpose":"目的","decisions":[],"currentState":[],"remainingWork":[],"rejectedApproaches":[],"openQuestions":[],"importantFiles":[]}
+        """;
+    var invalidBodies = new[]
+    {
+        new FacadeProcessResult(1, """{"status":"failed","failure":{"summary":"agent failed"}}""", "failed stderr"),
+        new FacadeProcessResult(4, """{"status":"timed_out","error":"timeout"}""", ""),
+        new FacadeProcessResult(3, """{"status":"cancelled"}""", ""),
+        new FacadeProcessResult(0, "not-json", "bad stdout"),
+        FacadeResult("assistant_transcript", validBody),
+        FacadeResult("final_response", ""),
+        FacadeResult("final_response", """{"purpose":"missing"}"""),
+    };
+
+    foreach (var processResult in invalidBodies)
+    {
+        var model = new FacadeHandoffModel(
+            "unused",
+            (_, _, _) => Task.FromResult(processResult));
+        await AssertThrowsAsync("facade failure", () =>
+            model.CreateAsync("copilot-model", "prompt", directory, CancellationToken.None));
+    }
+}
+
+static FacadeProcessResult FacadeResult(string outputKind, string outputText) =>
+    new(
+        0,
+        new JsonObject
+        {
+            ["status"] = "completed",
+            ["result"] = new JsonObject
+            {
+                ["agent"] = "github-copilot",
+                ["outputKind"] = outputKind,
+                ["outputText"] = outputText,
+            },
+        }.ToJsonString(),
+        "");
+
+static async Task FacadeCliDoesNotRequireApiKey()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"facade-cli-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var cliPath = Path.Combine(directory, "CodexAgentFacadeCli.exe");
+    var output = Path.Combine(directory, "handoff.json");
+    File.WriteAllText(cliPath, "");
+    var model = new FakeModel();
+    var threads = new FakeThreads(new ThreadSnapshot(
+        "abc",
+        null,
+        directory,
+        [new StoredItem("t1", User("continue", null))]));
+    try
+    {
+        var apiKeyReads = 0;
+        var exit = await Cli.RunAsync(
+            [
+                "codex://threads/abc",
+                "--backend", "facade",
+                "--model", "copilot-model",
+                "--facade-cli", cliPath,
+                "-o", output,
+            ],
+            name =>
+            {
+                if (name == ApiKeyResolver.VariableName)
+                {
+                    apiKeyReads++;
+                    return null;
+                }
+
+                return null;
+            },
+            threads,
+            model,
+            new StringWriter(),
+            new StringWriter(),
+            CancellationToken.None);
+        AssertEqual(0, exit);
+        AssertEqual(0, apiKeyReads);
+        AssertEqual("copilot-model", model.Model!);
+        AssertEqual(true, File.Exists(output));
+        AssertEqual(Path.GetFullPath(directory), model.WorkingDirectory);
+
+        var failingOutput = Path.Combine(directory, "failed-handoff.json");
+        var failureStderr = new StringWriter();
+        var failureExit = await Cli.RunAsync(
+            [
+                "codex://threads/abc",
+                "--backend", "facade",
+                "--model", "copilot-model",
+                "--facade-cli", cliPath,
+                "-o", failingOutput,
+            ],
+            _ => null,
+            threads,
+            new FailingModel(),
+            new StringWriter(),
+            failureStderr,
+            CancellationToken.None);
+        AssertEqual(1, failureExit);
+        AssertEqual(false, File.Exists(failingOutput));
+        AssertContains(failureStderr.ToString(), "stub model failure");
+    }
+    finally
+    {
+        DeleteDirectory(directory);
+    }
 }
 
 static Task FilterMessages()
@@ -422,7 +625,7 @@ static async Task GitSnapshot()
             CancellationToken.None);
         AssertEqual(0, exit);
         AssertEqual("gpt-test", model.Model);
-        AssertEqual("test-key", model.ApiKey);
+        AssertEqual(Path.GetFullPath(repo), model.WorkingDirectory);
         AssertContains(model.Prompt!, "may already be committed");
         AssertDoesNotContain(model.Prompt!, "no such change");
         AssertContains(model.Prompt!, "tracked.txt");
@@ -829,6 +1032,20 @@ static void AssertThrows(string name, Action action)
     throw new InvalidOperationException($"Expected failure: {name}");
 }
 
+static async Task AssertThrowsAsync(string name, Func<Task> action)
+{
+    try
+    {
+        await action();
+    }
+    catch (HandoffException)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException($"Expected failure: {name}");
+}
+
 internal sealed class FakeThreads(ThreadSnapshot snapshot) : IThreadSource
 {
     public List<string> Requested { get; } = [];
@@ -851,17 +1068,31 @@ internal sealed class FakeModel : IHandoffModel
 {
     public bool Called { get; set; }
     public string? Model { get; private set; }
-    public string? ApiKey { get; private set; }
     public string? Prompt { get; private set; }
+    public string? WorkingDirectory { get; private set; }
 
-    public Task<HandoffBody> CreateAsync(string model, string apiKey, string prompt, CancellationToken cancellationToken)
+    public Task<HandoffBody> CreateAsync(
+        string model,
+        string prompt,
+        string workingDirectory,
+        CancellationToken cancellationToken)
     {
         Called = true;
         Model = model;
-        ApiKey = apiKey;
         Prompt = prompt;
+        WorkingDirectory = workingDirectory;
         return Task.FromResult(new HandoffBody("purpose", [], ["state"], ["rest"], [], [], ["tracked.txt"]));
     }
+}
+
+internal sealed class FailingModel : IHandoffModel
+{
+    public Task<HandoffBody> CreateAsync(
+        string model,
+        string prompt,
+        string workingDirectory,
+        CancellationToken cancellationToken) =>
+        throw new HandoffException("stub model failure");
 }
 
 internal sealed record ServerRun(ThreadSnapshot? Snapshot, string? Error, string[] Methods, string[] Requests);

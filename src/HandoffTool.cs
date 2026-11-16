@@ -517,7 +517,7 @@ internal static class GitSnapshotCollector
 
     private static RepositoryCapture Missing(string warning) => new(null, [warning]);
 
-    private static string NormalizeCwd(string cwd)
+    internal static string NormalizeCwd(string cwd)
     {
         if (cwd.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
             Uri.TryCreate(cwd, UriKind.Absolute, out var uri) &&
@@ -752,14 +752,14 @@ internal static class HandoffBodyParser
         }
         catch (JsonException ex)
         {
-            throw new HandoffException($"OpenAI handoff body was not JSON: {ex.Message}");
+            throw new HandoffException($"Handoff body was not JSON: {ex.Message}");
         }
 
         using (document)
         {
             if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
-                throw new HandoffException("OpenAI handoff body was not a JSON object.");
+                throw new HandoffException("Handoff body was not a JSON object.");
             }
 
             var allowed = new HashSet<string>(StringArrayProperties, StringComparer.Ordinal) { "purpose" };
@@ -767,13 +767,13 @@ internal static class HandoffBodyParser
             {
                 if (!allowed.Contains(property.Name))
                 {
-                    throw new HandoffException($"OpenAI handoff body contains unsupported property '{property.Name}'.");
+                    throw new HandoffException($"Handoff body contains unsupported property '{property.Name}'.");
                 }
             }
 
             if (!document.RootElement.TryGetProperty("purpose", out var purpose) || purpose.ValueKind != JsonValueKind.String)
             {
-                throw new HandoffException("OpenAI handoff body is missing string property 'purpose'.");
+                throw new HandoffException("Handoff body is missing string property 'purpose'.");
             }
 
             var arrays = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
@@ -781,7 +781,7 @@ internal static class HandoffBodyParser
             {
                 if (!document.RootElement.TryGetProperty(name, out var array) || array.ValueKind != JsonValueKind.Array)
                 {
-                    throw new HandoffException($"OpenAI handoff body is missing string array '{name}'.");
+                    throw new HandoffException($"Handoff body is missing string array '{name}'.");
                 }
 
                 var values = new List<string>();
@@ -789,7 +789,7 @@ internal static class HandoffBodyParser
                 {
                     if (entry.ValueKind != JsonValueKind.String)
                     {
-                        throw new HandoffException($"OpenAI handoff body property '{name}' contains a non-string item.");
+                        throw new HandoffException($"Handoff body property '{name}' contains a non-string item.");
                     }
 
                     values.Add(entry.GetString() ?? "");
@@ -1073,7 +1073,11 @@ internal interface IThreadSource
 
 internal interface IHandoffModel
 {
-    Task<HandoffBody> CreateAsync(string model, string apiKey, string prompt, CancellationToken cancellationToken);
+    Task<HandoffBody> CreateAsync(
+        string model,
+        string prompt,
+        string workingDirectory,
+        CancellationToken cancellationToken);
 }
 
 internal static class HandoffWorkflow
@@ -1082,7 +1086,6 @@ internal static class HandoffWorkflow
         string threadId,
         string outputPath,
         string model,
-        string apiKey,
         IThreadSource threads,
         IHandoffModel handoffModel,
         CancellationToken cancellationToken,
@@ -1097,8 +1100,23 @@ internal static class HandoffWorkflow
         var transcript = TranscriptFilter.Filter(snapshot.Items);
         var repository = await GitSnapshotCollector.CaptureAsync(snapshot.Cwd, cancellationToken);
         var prompt = PromptBuilder.Build(transcript, snapshot.Title, repository);
-        var body = await handoffModel.CreateAsync(model, apiKey, prompt, cancellationToken);
+        var workingDirectory = ResolveWorkingDirectory(snapshot.Cwd);
+        var body = await handoffModel.CreateAsync(model, prompt, workingDirectory, cancellationToken);
         return ArtifactBuilder.Build(snapshot, body, repository, transcript, outputPath, toolEntryFile);
+    }
+
+    private static string ResolveWorkingDirectory(string? cwd)
+    {
+        if (!string.IsNullOrWhiteSpace(cwd))
+        {
+            var normalized = GitSnapshotCollector.NormalizeCwd(cwd);
+            if (Directory.Exists(normalized))
+            {
+                return Path.GetFullPath(normalized);
+            }
+        }
+
+        return Directory.GetCurrentDirectory();
     }
 
     public static async Task<DumpDocument> DumpAsync(
@@ -1722,12 +1740,12 @@ internal static class CodexLaunchResolver
     }
 }
 
-internal sealed class OpenAiHandoffModel : IHandoffModel
+internal sealed class OpenAiHandoffModel(string apiKey) : IHandoffModel
 {
     public async Task<HandoffBody> CreateAsync(
         string model,
-        string apiKey,
         string prompt,
+        string workingDirectory,
         CancellationToken cancellationToken)
     {
 #pragma warning disable OPENAI001
@@ -1758,7 +1776,291 @@ internal sealed class OpenAiHandoffModel : IHandoffModel
     }
 }
 
-internal sealed record CliRequest(bool Dump, string Input, string? OutputPath, string? Model);
+internal static class FacadeCliPathResolver
+{
+    public const string VariableName = "CODEX_THREAD_HANDOFF_FACADE_CLI";
+
+    public static string Resolve(string? overridePath, Func<string, string?> readVariable)
+    {
+        var configured = overridePath ?? readVariable(VariableName);
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            throw new HandoffException(
+                $"{VariableName} is not set. Set it to the full path of CodexAgentFacadeCli.exe or pass --facade-cli <path>.");
+        }
+
+        configured = configured.Trim();
+        if (!Path.IsPathFullyQualified(configured))
+        {
+            throw new HandoffException($"Facade CLI path must be a full path: {configured}");
+        }
+
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(configured);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new HandoffException($"Facade CLI path is invalid: {ex.Message}");
+        }
+
+        if (!File.Exists(fullPath))
+        {
+            throw new HandoffException($"Facade CLI file does not exist: {fullPath}");
+        }
+
+        return fullPath;
+    }
+}
+
+internal sealed record FacadeProcessResult(int ExitCode, string Stdout, string Stderr);
+
+internal sealed class FacadeHandoffModel : IHandoffModel
+{
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+    private readonly string _cliPath;
+    private readonly Func<string, string, CancellationToken, Task<FacadeProcessResult>> _runProcess;
+
+    public FacadeHandoffModel(
+        string cliPath,
+        Func<string, string, CancellationToken, Task<FacadeProcessResult>>? runProcess = null)
+    {
+        _cliPath = cliPath;
+        _runProcess = runProcess ?? RunProcessAsync;
+    }
+
+    public async Task<HandoffBody> CreateAsync(
+        string model,
+        string prompt,
+        string workingDirectory,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(model))
+        {
+            throw new HandoffException("Facade backend requires a model id.");
+        }
+
+        if (!Path.IsPathFullyQualified(workingDirectory) || !Directory.Exists(workingDirectory))
+        {
+            throw new HandoffException($"Facade working directory does not exist: {workingDirectory}");
+        }
+
+        var request = BuildRequest(model, prompt, workingDirectory);
+        FacadeProcessResult process;
+        try
+        {
+            process = await _runProcess(_cliPath, request, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new HandoffException("Facade CLI execution was cancelled.");
+        }
+
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(process.Stdout);
+        }
+        catch (JsonException ex)
+        {
+            throw new HandoffException(
+                $"Facade CLI stdout was not valid JSON (exit code {process.ExitCode}): {ex.Message}{DescribeStderr(process.Stderr)}");
+        }
+
+        using (document)
+        {
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new HandoffException("Facade CLI response was not a JSON object.");
+            }
+
+            var status = ReadOptionalString(document.RootElement, "status") ?? "(missing)";
+            if (process.ExitCode != 0 || !string.Equals(status, "completed", StringComparison.Ordinal))
+            {
+                var detail = ReadFailureDetail(document.RootElement);
+                throw new HandoffException(
+                    $"Facade CLI did not complete: exit code {process.ExitCode}, status '{status}'{detail}{DescribeStderr(process.Stderr)}");
+            }
+
+            if (!document.RootElement.TryGetProperty("result", out var result) ||
+                result.ValueKind != JsonValueKind.Object)
+            {
+                throw new HandoffException("Facade CLI completed response is missing object property 'result'.");
+            }
+
+            var agent = ReadOptionalString(result, "agent");
+            if (!string.Equals(agent, "github-copilot", StringComparison.Ordinal))
+            {
+                throw new HandoffException($"Facade CLI result has unexpected agent '{agent ?? "(missing)"}'.");
+            }
+
+            var outputKind = ReadOptionalString(result, "outputKind");
+            if (!string.Equals(outputKind, "final_response", StringComparison.Ordinal))
+            {
+                throw new HandoffException($"Facade CLI result has unexpected outputKind '{outputKind ?? "(missing)"}'.");
+            }
+
+            var outputText = ReadOptionalString(result, "outputText");
+            if (string.IsNullOrWhiteSpace(outputText))
+            {
+                throw new HandoffException("Facade CLI result.outputText was empty.");
+            }
+
+            return HandoffBodyParser.Parse(outputText);
+        }
+    }
+
+    internal static string BuildRequest(string model, string prompt, string workingDirectory)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false }))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("agent", "github-copilot");
+            writer.WriteString(
+                "prompt",
+                "Create the requested handoff from the supplied filtered transcript and repository status. " +
+                "Do not call tools or edit files. Return only one JSON object matching this schema, with no markdown fences or commentary.\n" +
+                HandoffBodyParser.SchemaJson +
+                "\n\n" +
+                prompt);
+            writer.WriteString("working_directory", workingDirectory);
+            writer.WriteBoolean("auto_approve", false);
+            writer.WriteString("model", model);
+            writer.WriteEndObject();
+        }
+
+        return Utf8NoBom.GetString(stream.ToArray());
+    }
+
+    private static string? ReadOptionalString(JsonElement element, string name)
+    {
+        return element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private static string ReadFailureDetail(JsonElement response)
+    {
+        var error = ReadOptionalString(response, "error");
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            return $": {BoundDetail(error)}";
+        }
+
+        if (response.TryGetProperty("failure", out var failure) &&
+            failure.ValueKind == JsonValueKind.Object)
+        {
+            var summary = ReadOptionalString(failure, "summary");
+            if (!string.IsNullOrWhiteSpace(summary))
+            {
+                return $": {BoundDetail(summary)}";
+            }
+        }
+
+        return "";
+    }
+
+    private static string DescribeStderr(string stderr)
+    {
+        var detail = stderr.Trim();
+        return string.IsNullOrEmpty(detail) ? "" : $". stderr: {BoundDetail(detail)}";
+    }
+
+    private static string BoundDetail(string detail)
+    {
+        var normalized = detail.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal).Trim();
+        return normalized.Length <= 500 ? normalized : normalized[..500];
+    }
+
+    private static async Task<FacadeProcessResult> RunProcessAsync(
+        string cliPath,
+        string request,
+        CancellationToken cancellationToken)
+    {
+        var start = new ProcessStartInfo
+        {
+            FileName = cliPath,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardInputEncoding = Utf8NoBom,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+
+        using var process = new Process { StartInfo = start };
+        try
+        {
+            if (!process.Start())
+            {
+                throw new HandoffException($"Failed to start Facade CLI: {cliPath}");
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            throw new HandoffException($"Failed to start Facade CLI: {ex.Message}");
+        }
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        try
+        {
+            await process.StandardInput.WriteAsync(request.AsMemory(), cancellationToken);
+            process.StandardInput.Close();
+            await process.WaitForExitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            throw;
+        }
+        catch (IOException ex)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            throw new HandoffException($"Failed to communicate with Facade CLI: {ex.Message}");
+        }
+
+        return new FacadeProcessResult(
+            process.ExitCode,
+            await stdoutTask,
+            await stderrTask);
+    }
+}
+
+internal enum HandoffBackend
+{
+    OpenAi,
+    Facade,
+}
+
+internal sealed record CliRequest(
+    bool Dump,
+    string Input,
+    string? OutputPath,
+    string? Model,
+    HandoffBackend Backend,
+    string? FacadeCliPath,
+    bool BackendSpecified);
 
 internal static class CliParser
 {
@@ -1767,6 +2069,9 @@ internal static class CliParser
         string? input = null;
         string? output = null;
         string? model = null;
+        string? facadeCliPath = null;
+        var backend = HandoffBackend.OpenAi;
+        var backendSpecified = false;
         var dump = false;
         for (var i = 0; i < args.Length; i++)
         {
@@ -1780,6 +2085,25 @@ internal static class CliParser
             if (arg == "--model")
             {
                 model = ReadValue(args, ref i, "--model");
+                continue;
+            }
+
+            if (arg == "--backend")
+            {
+                backendSpecified = true;
+                var value = ReadValue(args, ref i, "--backend");
+                backend = value.ToLowerInvariant() switch
+                {
+                    "openai" => HandoffBackend.OpenAi,
+                    "facade" => HandoffBackend.Facade,
+                    _ => throw new HandoffException($"Unknown backend '{value}'. Expected 'openai' or 'facade'."),
+                };
+                continue;
+            }
+
+            if (arg == "--facade-cli")
+            {
+                facadeCliPath = ReadValue(args, ref i, "--facade-cli");
                 continue;
             }
 
@@ -1804,12 +2128,13 @@ internal static class CliParser
 
         if (input is null)
         {
-            throw new HandoffException("Usage: codex-thread-handoff <deeplink> [-o path] [--model id] | codex-thread-handoff dump <deeplink|handoff.json>");
+            throw new HandoffException(
+                "Usage: codex-thread-handoff <deeplink> [-o path] [--backend openai|facade] [--model id] [--facade-cli path] | codex-thread-handoff dump <deeplink|handoff.json>");
         }
 
-        if (dump && (output is not null || model is not null))
+        if (dump && (output is not null || model is not null || facadeCliPath is not null || backendSpecified))
         {
-            throw new HandoffException("dump does not accept -o or --model.");
+            throw new HandoffException("dump does not accept -o, --backend, --model, or --facade-cli.");
         }
 
         if (model is not null && string.IsNullOrWhiteSpace(model))
@@ -1817,7 +2142,17 @@ internal static class CliParser
             throw new HandoffException("--model requires a model id.");
         }
 
-        return new CliRequest(dump, input, output, model);
+        if (backend == HandoffBackend.Facade && model is null)
+        {
+            throw new HandoffException("--model is required when --backend facade is used.");
+        }
+
+        if (backend == HandoffBackend.OpenAi && facadeCliPath is not null)
+        {
+            throw new HandoffException("--facade-cli can only be used with --backend facade.");
+        }
+
+        return new CliRequest(dump, input, output, model, backend, facadeCliPath, backendSpecified);
     }
 
     private static string ReadValue(string[] args, ref int index, string name)
@@ -1832,18 +2167,52 @@ internal static class CliParser
     }
 }
 
+internal sealed record ResolvedBackend(HandoffBackend Backend, string? ApiKey, string? FacadeCliPath);
+
 internal static class Cli
 {
-    public const string DefaultModel = "gpt-6-luna";
+    public const string DefaultOpenAiModel = "gpt-6-luna";
 
     public static Task<int> RunAsync(string[] args, [CallerFilePath] string toolEntryFile = "") =>
-        RunAsync(args, Environment.GetEnvironmentVariable, new CodexAppServerThreadSource(), new OpenAiHandoffModel(), Console.Out, Console.Error, CancellationToken.None, toolEntryFile);
+        RunAsync(
+            args,
+            Environment.GetEnvironmentVariable,
+            new CodexAppServerThreadSource(),
+            backend => backend.Backend switch
+            {
+                HandoffBackend.OpenAi => new OpenAiHandoffModel(backend.ApiKey!),
+                HandoffBackend.Facade => new FacadeHandoffModel(backend.FacadeCliPath!),
+                _ => throw new HandoffException($"Unsupported backend '{backend.Backend}'."),
+            },
+            Console.Out,
+            Console.Error,
+            CancellationToken.None,
+            toolEntryFile);
 
     internal static async Task<int> RunAsync(
         string[] args,
         Func<string, string?> readVariable,
         IThreadSource threads,
         IHandoffModel model,
+        TextWriter stdout,
+        TextWriter stderr,
+        CancellationToken cancellationToken,
+        string? toolEntryFile = null) =>
+        await RunAsync(
+            args,
+            readVariable,
+            threads,
+            _ => model,
+            stdout,
+            stderr,
+            cancellationToken,
+            toolEntryFile);
+
+    internal static async Task<int> RunAsync(
+        string[] args,
+        Func<string, string?> readVariable,
+        IThreadSource threads,
+        Func<ResolvedBackend, IHandoffModel> createModel,
         TextWriter stdout,
         TextWriter stderr,
         CancellationToken cancellationToken,
@@ -1860,7 +2229,18 @@ internal static class Cli
                 return 0;
             }
 
-            var apiKey = ApiKeyResolver.Resolve(readVariable);
+            ResolvedBackend backend = request.Backend switch
+            {
+                HandoffBackend.OpenAi => new ResolvedBackend(
+                    request.Backend,
+                    ApiKeyResolver.Resolve(readVariable),
+                    null),
+                HandoffBackend.Facade => new ResolvedBackend(
+                    request.Backend,
+                    null,
+                    FacadeCliPathResolver.Resolve(request.FacadeCliPath, readVariable)),
+                _ => throw new HandoffException($"Unsupported backend '{request.Backend}'."),
+            };
             var generateThreadId = DeeplinkParser.ParseThreadId(request.Input);
             var outputPath = request.OutputPath ?? Path.Combine(Directory.GetCurrentDirectory(), $"handoff-{generateThreadId}.json");
             var outputDirectory = Path.GetDirectoryName(Path.GetFullPath(outputPath));
@@ -1872,10 +2252,9 @@ internal static class Cli
             var artifact = await HandoffWorkflow.CreateAsync(
                 generateThreadId,
                 outputPath,
-                request.Model ?? DefaultModel,
-                apiKey,
+                request.Model ?? DefaultOpenAiModel,
                 threads,
-                model,
+                createModel(backend),
                 cancellationToken,
                 toolEntryFile);
             await File.WriteAllTextAsync(outputPath, JsonText.Serialize(artifact), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
