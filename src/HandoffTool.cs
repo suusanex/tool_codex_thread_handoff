@@ -1818,16 +1818,25 @@ internal sealed record FacadeProcessResult(int ExitCode, string Stdout, string S
 
 internal sealed class FacadeHandoffModel : IHandoffModel
 {
+    public const int DefaultTimeoutSeconds = 600;
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
     private readonly string _cliPath;
     private readonly Func<string, string, CancellationToken, Task<FacadeProcessResult>> _runProcess;
+    private readonly int _timeoutSeconds;
 
     public FacadeHandoffModel(
         string cliPath,
-        Func<string, string, CancellationToken, Task<FacadeProcessResult>>? runProcess = null)
+        Func<string, string, CancellationToken, Task<FacadeProcessResult>>? runProcess = null,
+        int timeoutSeconds = DefaultTimeoutSeconds)
     {
+        if (timeoutSeconds is < 1 or > 86400)
+        {
+            throw new HandoffException($"Facade timeout must be between 1 and 86400 seconds: {timeoutSeconds}");
+        }
+
         _cliPath = cliPath;
         _runProcess = runProcess ?? RunProcessAsync;
+        _timeoutSeconds = timeoutSeconds;
     }
 
     public async Task<HandoffBody> CreateAsync(
@@ -1846,15 +1855,21 @@ internal sealed class FacadeHandoffModel : IHandoffModel
             throw new HandoffException($"Facade working directory does not exist: {workingDirectory}");
         }
 
-        var request = BuildRequest(model, prompt, workingDirectory);
+        var request = BuildRequest(model, prompt, workingDirectory, _timeoutSeconds);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(_timeoutSeconds));
         FacadeProcessResult process;
         try
         {
-            process = await _runProcess(_cliPath, request, cancellationToken);
+            process = await _runProcess(_cliPath, request, timeout.Token);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw new HandoffException("Facade CLI execution was cancelled.");
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            throw new HandoffException($"Facade CLI timed out after {_timeoutSeconds} seconds.");
         }
 
         JsonDocument document;
@@ -1911,7 +1926,11 @@ internal sealed class FacadeHandoffModel : IHandoffModel
         }
     }
 
-    internal static string BuildRequest(string model, string prompt, string workingDirectory)
+    internal static string BuildRequest(
+        string model,
+        string prompt,
+        string workingDirectory,
+        int timeoutSeconds)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false }))
@@ -1928,6 +1947,7 @@ internal sealed class FacadeHandoffModel : IHandoffModel
             writer.WriteString("working_directory", workingDirectory);
             writer.WriteBoolean("auto_approve", false);
             writer.WriteString("model", model);
+            writer.WriteNumber("timeout_seconds", timeoutSeconds);
             writer.WriteEndObject();
         }
 
@@ -2173,21 +2193,37 @@ internal static class Cli
 {
     public const string DefaultOpenAiModel = "gpt-6-luna";
 
-    public static Task<int> RunAsync(string[] args, [CallerFilePath] string toolEntryFile = "") =>
-        RunAsync(
-            args,
-            Environment.GetEnvironmentVariable,
-            new CodexAppServerThreadSource(),
-            backend => backend.Backend switch
-            {
-                HandoffBackend.OpenAi => new OpenAiHandoffModel(backend.ApiKey!),
-                HandoffBackend.Facade => new FacadeHandoffModel(backend.FacadeCliPath!),
-                _ => throw new HandoffException($"Unsupported backend '{backend.Backend}'."),
-            },
-            Console.Out,
-            Console.Error,
-            CancellationToken.None,
-            toolEntryFile);
+    public static async Task<int> RunAsync(string[] args, [CallerFilePath] string toolEntryFile = "")
+    {
+        using var cancellation = new CancellationTokenSource();
+        ConsoleCancelEventHandler cancel = (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+        Console.CancelKeyPress += cancel;
+        try
+        {
+            return await RunAsync(
+                args,
+                Environment.GetEnvironmentVariable,
+                new CodexAppServerThreadSource(),
+                backend => backend.Backend switch
+                {
+                    HandoffBackend.OpenAi => new OpenAiHandoffModel(backend.ApiKey!),
+                    HandoffBackend.Facade => new FacadeHandoffModel(backend.FacadeCliPath!),
+                    _ => throw new HandoffException($"Unsupported backend '{backend.Backend}'."),
+                },
+                Console.Out,
+                Console.Error,
+                cancellation.Token,
+                toolEntryFile);
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancel;
+        }
+    }
 
     internal static async Task<int> RunAsync(
         string[] args,

@@ -46,7 +46,7 @@ Facade が起動する `copilot` を PATH から実行できるよう GitHub Cop
 
 配置した exe のフルパスを専用環境変数へ設定するか、実行ごとに `--facade-cli` で上書きします。引数が指定されていれば環境変数より優先します。相対パスや存在しないファイルは使わず、原因を示して失敗します。PATH の `CodexAgentFacadeCli.exe` 自動探索はしません。
 
-`auto_approve=false` は Facade の request へ明示されます。ただし、Copilot CLI 側の既存権限設定を上書きして全ツール利用を禁止する保証ではありません。handoff 生成は要約だけを行い、このツールが prompt にもツール呼び出しやファイル編集の禁止を明記しています。
+`auto_approve=false` と `timeout_seconds=600` は Facade の request へ明示されます。10 分経過または Ctrl+C で呼び出し側が Facade process tree を終了し、handoff を保存せず原因を示して失敗します。`auto_approve=false` は Copilot CLI 側の既存権限設定を上書きして全ツール利用を禁止する保証ではありません。handoff 生成は要約だけを行い、このツールが prompt にもツール呼び出しやファイル編集の禁止を明記しています。
 
 ## 生成
 

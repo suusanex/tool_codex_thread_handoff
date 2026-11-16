@@ -20,6 +20,7 @@ await Test(failures, "api key resolution", ApiKeyResolution);
 await Test(failures, "backend and facade path parsing", BackendAndFacadePathParsing);
 await Test(failures, "facade request and response", FacadeRequestAndResponse);
 await Test(failures, "facade failures", FacadeFailures);
+await Test(failures, "facade cancellation and timeout", FacadeCancellationAndTimeout);
 await Test(failures, "facade CLI does not require API key", FacadeCliDoesNotRequireApiKey);
 await Test(failures, "final agent message and excluded tool output", FilterMessages);
 await Test(failures, "long transcript bound", LongTranscript);
@@ -169,6 +170,7 @@ static async Task FacadeRequestAndResponse()
     AssertEqual("copilot-model", root.GetProperty("model").GetString()!);
     AssertEqual(directory, root.GetProperty("working_directory").GetString()!);
     AssertEqual(false, root.GetProperty("auto_approve").GetBoolean());
+    AssertEqual(FacadeHandoffModel.DefaultTimeoutSeconds, root.GetProperty("timeout_seconds").GetInt32());
     AssertContains(root.GetProperty("prompt").GetString()!, HandoffBodyParser.SchemaJson);
     AssertContains(root.GetProperty("prompt").GetString()!, "FILTERED_INPUT");
     AssertContains(root.GetProperty("prompt").GetString()!, "Do not call tools or edit files.");
@@ -202,6 +204,33 @@ static async Task FacadeFailures()
         await AssertThrowsAsync("facade failure", () =>
             model.CreateAsync("copilot-model", "prompt", directory, CancellationToken.None));
     }
+}
+
+static async Task FacadeCancellationAndTimeout()
+{
+    var directory = Path.GetFullPath(Directory.GetCurrentDirectory());
+    static async Task<FacadeProcessResult> WaitForever(
+        string path,
+        string request,
+        CancellationToken cancellationToken)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        throw new InvalidOperationException("Unreachable.");
+    }
+
+    using (var cancellation = new CancellationTokenSource())
+    {
+        cancellation.Cancel();
+        var model = new FacadeHandoffModel("unused", WaitForever);
+        var message = await CaptureHandoffExceptionAsync(() =>
+            model.CreateAsync("copilot-model", "prompt", directory, cancellation.Token));
+        AssertContains(message, "cancelled");
+    }
+
+    var timeoutModel = new FacadeHandoffModel("unused", WaitForever, timeoutSeconds: 1);
+    var timeoutMessage = await CaptureHandoffExceptionAsync(() =>
+        timeoutModel.CreateAsync("copilot-model", "prompt", directory, CancellationToken.None));
+    AssertContains(timeoutMessage, "timed out after 1 seconds");
 }
 
 static FacadeProcessResult FacadeResult(string outputKind, string outputText) =>
@@ -1044,6 +1073,20 @@ static async Task AssertThrowsAsync(string name, Func<Task> action)
     }
 
     throw new InvalidOperationException($"Expected failure: {name}");
+}
+
+static async Task<string> CaptureHandoffExceptionAsync(Func<Task> action)
+{
+    try
+    {
+        await action();
+    }
+    catch (HandoffException ex)
+    {
+        return ex.Message;
+    }
+
+    throw new InvalidOperationException("Expected HandoffException.");
 }
 
 internal sealed class FakeThreads(ThreadSnapshot snapshot) : IThreadSource
