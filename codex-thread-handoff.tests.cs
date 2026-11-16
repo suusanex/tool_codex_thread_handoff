@@ -255,7 +255,9 @@ static async Task FacadeCliDoesNotRequireApiKey()
     var cliPath = Path.Combine(directory, "CodexAgentFacadeCli.exe");
     var output = Path.Combine(directory, "handoff.json");
     File.WriteAllText(cliPath, "");
-    var model = new FakeModel();
+    var bodyJson = """
+        {"purpose":"目的","decisions":[],"currentState":[],"remainingWork":[],"rejectedApproaches":[],"openQuestions":[],"importantFiles":[]}
+        """;
     var threads = new FakeThreads(new ThreadSnapshot(
         "abc",
         null,
@@ -264,6 +266,9 @@ static async Task FacadeCliDoesNotRequireApiKey()
     try
     {
         var apiKeyReads = 0;
+        ResolvedBackend? selectedBackend = null;
+        string? capturedPath = null;
+        string? capturedRequest = null;
         var exit = await Cli.RunAsync(
             [
                 "codex://threads/abc",
@@ -283,15 +288,32 @@ static async Task FacadeCliDoesNotRequireApiKey()
                 return null;
             },
             threads,
-            model,
+            backend =>
+            {
+                selectedBackend = backend;
+                return Cli.CreateHandoffModel(
+                    backend,
+                    (path, request, cancellationToken) =>
+                    {
+                        capturedPath = path;
+                        capturedRequest = request;
+                        return Task.FromResult(FacadeResult("final_response", bodyJson));
+                    });
+            },
             new StringWriter(),
             new StringWriter(),
             CancellationToken.None);
         AssertEqual(0, exit);
         AssertEqual(0, apiKeyReads);
-        AssertEqual("copilot-model", model.Model!);
+        AssertEqual(HandoffBackend.Facade, selectedBackend!.Backend);
+        AssertEqual(null, selectedBackend.ApiKey);
+        AssertEqual(Path.GetFullPath(cliPath), selectedBackend.FacadeCliPath);
+        AssertEqual(Path.GetFullPath(cliPath), capturedPath);
         AssertEqual(true, File.Exists(output));
-        AssertEqual(Path.GetFullPath(directory), model.WorkingDirectory);
+        using var requestDocument = JsonDocument.Parse(capturedRequest!);
+        AssertEqual("github-copilot", requestDocument.RootElement.GetProperty("agent").GetString()!);
+        AssertEqual("copilot-model", requestDocument.RootElement.GetProperty("model").GetString()!);
+        AssertEqual(Path.GetFullPath(directory), requestDocument.RootElement.GetProperty("working_directory").GetString());
 
         var failingOutput = Path.Combine(directory, "failed-handoff.json");
         var failureStderr = new StringWriter();
